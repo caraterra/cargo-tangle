@@ -5,20 +5,29 @@ extern crate pretty_env_logger;
 use glob::glob;
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
+use petgraph::graphmap::DiGraphMap;
+use petgraph::algo::is_cyclic_directed;
 use pulldown_cmark::{CodeBlockKind::Fenced, CowStr::Borrowed, Event, Parser, Tag::CodeBlock};
 use regex::{Regex, RegexBuilder};
 use std::collections::HashMap;
 use std::path::Path;
-use std::{env, fs, io};
+use std::{env, fs};
 
+#[derive(Debug)]
 enum CodeMacroParseError {
     MissingIndentifier,
+}
+
+#[derive(Debug)]
+enum CodeMacroLinkError {
+    CyclicInclusion,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct CodeMacro {
     name: String,
     content: String,
+    uuid: usize,
 }
 
 impl TryFrom<String> for CodeMacro {
@@ -44,6 +53,7 @@ impl TryFrom<String> for CodeMacro {
         Ok(CodeMacro {
             name: name.to_owned(),
             content: text.replace(definition, name),
+            uuid: 0
         })
     }
 }
@@ -85,11 +95,13 @@ fn expand_code_macros(code_macros: &CodeMacroCollection) -> String {
     output
 }
 
-fn tangle(path: &Path) -> Result<(), io::Error> {
-    let input_file_contents = std::fs::read_to_string(path)?;
+fn tangle(path: &Path) -> Result<(), CodeMacroLinkError> {
+    let input_file_contents = std::fs::read_to_string(path).unwrap();
     let parser = Parser::new(&input_file_contents);
     let mut in_rust_code_block = false;
     let mut code_macros = CodeMacroCollection::new();
+    let mut dependency_graph = DiGraphMap::new();
+    let mut uuid = 0;
 
     for event in parser {
         match event {
@@ -100,7 +112,9 @@ fn tangle(path: &Path) -> Result<(), io::Error> {
                 if !in_rust_code_block {
                     continue;
                 }
-                if let Ok(new_macro) = CodeMacro::try_from(text.into_string()) {
+                if let Ok(mut new_macro) = CodeMacro::try_from(text.into_string()) {
+                    new_macro.uuid = uuid;
+                    uuid += 1;
                     if code_macros.contains_key(&new_macro.name) {
                         warn!("Redefinition found for macro {}", new_macro.name);
                     } else {
@@ -115,6 +129,23 @@ fn tangle(path: &Path) -> Result<(), io::Error> {
         }
     }
 
+    let macro_re = RegexBuilder::new(r"^ *//\s*<<(.+)>>\n")
+        .multi_line(true)
+        .build()
+        .unwrap();
+
+    for macro_definition in code_macros.values() {
+        for captures in macro_re.captures_iter(macro_definition.content.as_str()) {
+            let macro_invokation_name = captures.get(1).unwrap().as_str();
+            let macro_invokation = code_macros.get(macro_invokation_name).unwrap();
+            dependency_graph.add_edge(macro_definition.uuid, macro_invokation.uuid, ());
+        }
+    }
+
+    if is_cyclic_directed(&dependency_graph) {
+        return Err(CodeMacroLinkError::CyclicInclusion);
+    }
+
     let output_path_name = format!(
         "{}/{}.rs",
         path.parent().unwrap().to_str().unwrap(),
@@ -123,7 +154,7 @@ fn tangle(path: &Path) -> Result<(), io::Error> {
 
     let output_path = Path::new(&output_path_name);
 
-    fs::write(output_path, expand_code_macros(&code_macros).as_str())?;
+    fs::write(output_path, expand_code_macros(&code_macros).as_str()).unwrap();
 
     info!(
         "Writing output of {} to {output_path_name}",
@@ -133,7 +164,7 @@ fn tangle(path: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn main() -> Result<(), io::Error> {
+fn main() {
     pretty_env_logger::init();
     let project_dir = env::args().nth(1).unwrap_or(".".to_string());
     let md_glob = format!("{project_dir}/src/**/*.md");
@@ -142,11 +173,9 @@ fn main() -> Result<(), io::Error> {
         match entry {
             Ok(path) => {
                 info!("Tangling {}", path.display());
-                tangle(&path)?;
+                tangle(&path).unwrap();
             }
             Err(e) => error!("{e}"),
         }
     }
-
-    Ok(())
 }
